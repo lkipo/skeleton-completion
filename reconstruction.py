@@ -2,6 +2,7 @@
 
 import numpy as np
 import networkx as nx
+from pathlib import Path
 from scipy.spatial import cKDTree, distance_matrix
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.optimize import least_squares
@@ -19,7 +20,7 @@ class VascularTreeReconstruction:
     """
 
     def __init__(self, skeleton_points, gamma=3.0, mu=3.6e-3,
-                 Q_perf=0.125, P_out=60, P_in=100):
+                 Q_perf=0.125, P_out=60, P_in=100, debug_export_dir=None):
         """
         Parameters:
         -----------
@@ -39,7 +40,7 @@ class VascularTreeReconstruction:
         self.points = np.array(skeleton_points)
         self.gamma = gamma
         self.mu = mu
-        self.Q_perf = Q_perf / 60000  # Convert mL/min to mm³/s
+        self.Q_perf = (Q_perf * 1000) / 60  # Convert mL/min to mm³/s
         self.P_out = P_out * 133.322  # Convert mmHg to Pa
         self.P_in = P_in * 133.322
         self.kappa = 8 * mu / np.pi
@@ -48,8 +49,71 @@ class VascularTreeReconstruction:
         self.graph = None
         self.root = None
         self.tree_structure = None
+        self.debug_export_dir = Path(debug_export_dir) if debug_export_dir else None
 
-    def build_graph_from_skeleton(self, k_neighbors=10, max_edge_length=None):
+    def _resolve_debug_dir(self, export_dir=None):
+        target = Path(export_dir) if export_dir else self.debug_export_dir
+        if target is None:
+            return None
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _export_graph_snapshot(self, graph, filename, stage):
+        payload = {
+            "type": "graph",
+            "stage": stage,
+            "nodes": [
+                {
+                    "id": int(node),
+                    "position": self.points[int(node)].tolist()
+                }
+                for node in graph.nodes()
+            ],
+            "edges": [
+                {
+                    "source": int(u),
+                    "target": int(v),
+                    "length": float(graph[u][v].get("length", 0.0))
+                }
+                for u, v in graph.edges()
+            ]
+        }
+
+        with open(filename, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _export_tree_snapshot(self, tree, radii, filename, root=None, stage=None):
+        if root is None:
+            roots = [n for n in tree.nodes() if tree.in_degree(n) == 0]
+            root = roots[0] if roots else None
+
+        payload = {
+            "type": "tree",
+            "stage": stage,
+            "root": int(root) if root is not None else None,
+            "nodes": [
+                {
+                    "id": int(node),
+                    "position": self.points[int(node)].tolist(),
+                    "radius": float(radii[int(node)]) if radii and int(node) in radii else None
+                }
+                for node in tree.nodes()
+            ],
+            "edges": [
+                {
+                    "source": int(u),
+                    "target": int(v),
+                    "length": float(tree[u][v].get("length", 0.0)),
+                    "radius": float(radii[int(v)]) if radii and int(v) in radii else None
+                }
+                for u, v in tree.edges()
+            ]
+        }
+
+        with open(filename, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def build_graph_from_skeleton(self, k_neighbors=10, max_edge_length=None, export_debug_dir=None):
         """
         Step 1-2: Build connected graph from skeleton points
         Uses k-nearest neighbors + MST to ensure connectivity
@@ -93,12 +157,26 @@ class VascularTreeReconstruction:
         for i, j, weight in zip(mst_coo.row, mst_coo.col, mst_coo.data):
             self.graph.add_edge(i, j, length=weight)
 
+        debug_dir = self._resolve_debug_dir(export_debug_dir)
+        if debug_dir is not None:
+            self._export_graph_snapshot(
+                self.graph.copy(),
+                debug_dir / "initial_mst.json",
+                stage="initial_mst"
+            )
+
         print(
             f"Graph built: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
 
         # Prune short branches
         if max_edge_length:
             self._prune_branches(max_edge_length)
+            if debug_dir is not None:
+                self._export_graph_snapshot(
+                    self.graph.copy(),
+                    debug_dir / "post_prune_graph.json",
+                    stage="post_prune"
+                )
 
         return self.graph
 
@@ -511,7 +589,8 @@ class VascularTreeReconstruction:
 
         return metrics
 
-    def reconstruct(self, k_neighbors=10, n_candidates=5, optimize_bifurcations=True, method="highest_z"):
+    def reconstruct(self, k_neighbors=10, n_candidates=5, optimize_bifurcations=True,
+                    method="highest_z", export_debug_dir=None):
         """
         Main reconstruction pipeline
 
@@ -528,7 +607,11 @@ class VascularTreeReconstruction:
         """
         # Step 1-2: Build graph
         if self.graph is None:
-            self.build_graph_from_skeleton(k_neighbors=k_neighbors)
+            self.build_graph_from_skeleton(
+                k_neighbors=k_neighbors,
+                export_debug_dir=export_debug_dir
+            )
+        debug_dir = self._resolve_debug_dir(export_debug_dir)
 
         # Step 3: Terminal points (already identified in graph structure)
 
@@ -548,6 +631,11 @@ class VascularTreeReconstruction:
             print(f"\nCandidate {i+1}/{len(candidates)}: node {root}")
 
             try:
+                candidate_debug_dir = None
+                if debug_dir is not None:
+                    candidate_debug_dir = debug_dir / f"candidate_{i+1:02d}_root_{root}"
+                    candidate_debug_dir.mkdir(parents=True, exist_ok=True)
+
                 # Step 5a: Orient tree from this root
                 tree = self.orient_tree_from_root(root)
 
@@ -559,17 +647,43 @@ class VascularTreeReconstruction:
                 # Step 5c: Compute radii
                 radii, R, beta, rho = self.compute_radii(tree, root, L)
 
+                if candidate_debug_dir is not None:
+                    self._export_tree_snapshot(
+                        tree,
+                        radii,
+                        candidate_debug_dir / "tree_initial.json",
+                        root=root,
+                        stage="oriented_tree"
+                    )
+
                 # Step 5d: Optimize bifurcations (optional)
                 if optimize_bifurcations:
                     bifurcations = [n for n in tree.nodes()
                                     if tree.out_degree(n) == 2 and tree.in_degree(n) == 1]
                     print(f"  Optimizing {len(bifurcations)} bifurcations...")
                     # Limit for speed
-                    for bif in bifurcations[:min(10, len(bifurcations))]:
+                    for step_idx, bif in enumerate(bifurcations[:min(10, len(bifurcations))], start=1):
                         self.optimize_bifurcation(tree, bif, radii)
+                        if candidate_debug_dir is not None:
+                            self._export_tree_snapshot(
+                                tree,
+                                radii,
+                                candidate_debug_dir / f"tree_after_bif_{step_idx:02d}_node_{bif}.json",
+                                root=root,
+                                stage=f"after_bifurcation_{step_idx}"
+                            )
 
                     # Recompute radii after optimization
                     radii, R, beta, rho = self.compute_radii(tree, root, L)
+
+                    if candidate_debug_dir is not None:
+                        self._export_tree_snapshot(
+                            tree,
+                            radii,
+                            candidate_debug_dir / "tree_after_radius_update.json",
+                            root=root,
+                            stage="after_radius_update"
+                        )
 
                 # Step 6: Evaluate quality
                 metrics = self.compute_quality_metrics(tree, root, radii, L)
@@ -591,12 +705,30 @@ class VascularTreeReconstruction:
                     best_radii = radii
                     best_metrics = metrics
 
+                if candidate_debug_dir is not None:
+                    self._export_tree_snapshot(
+                        tree,
+                        radii,
+                        candidate_debug_dir / "tree_final.json",
+                        root=root,
+                        stage="final_candidate_tree"
+                    )
+
             except Exception as e:
                 print(f"  Failed: {e}")
                 continue
 
         if best_tree is None:
             raise RuntimeError("No valid tree found from any root candidate")
+
+        if debug_dir is not None:
+            self._export_tree_snapshot(
+                best_tree,
+                best_radii,
+                debug_dir / "best_tree.json",
+                root=best_root,
+                stage="best_tree"
+            )
 
         print(f"\n=== Best tree (root={best_root}) ===")
         for k, v in best_metrics.items():
@@ -759,7 +891,7 @@ class MultiTreeReconstruction:
     """
 
     def __init__(self, skeleton_points, n_trees=3, gamma=3.0, mu=3.6e-3,
-                 Q_perf=0.125, P_out=60, P_in=100):
+                 Q_perf=0.125, P_out=60, P_in=100, debug_export_dir=None):
         """
         Parameters:
         -----------
@@ -781,9 +913,19 @@ class MultiTreeReconstruction:
         self.trees = []  # List of reconstructed trees
         self.remaining_points = self.original_points.copy()
         self.point_to_tree_mapping = {}  # Maps original point index to tree index
+        self.debug_export_dir = Path(debug_export_dir) if debug_export_dir else None
+
+    def _resolve_debug_dir(self, export_dir=None):
+        target = Path(export_dir) if export_dir else self.debug_export_dir
+        if target is None:
+            return None
+        target.mkdir(parents=True, exist_ok=True)
+        return target
 
     def reconstruct_multiple_trees(self, k_neighbors_initial=5, k_neighbors_optimization=10,
-                                   min_tree_size=50, max_iterations=10, methods=["highest_z", "highest_z", "lowest_z"]):
+                                   min_tree_size=50, max_iterations=10,
+                                   methods=["highest_z", "highest_z", "lowest_z"],
+                                   export_debug_dir=None):
         """
         Extract multiple trees iteratively
 
@@ -814,6 +956,7 @@ class MultiTreeReconstruction:
         print(f"Target: {self.n_trees} trees\n")
 
         iteration = 0
+        debug_dir = self._resolve_debug_dir(export_debug_dir)
 
         while len(self.remaining_points) >= min_tree_size and iteration < max_iterations:
             iteration += 1
@@ -825,12 +968,18 @@ class MultiTreeReconstruction:
             root_method = methods[(iteration - 1) % len(methods)]
             print(f"Using root candidate method: {root_method}")
 
+            iteration_debug_dir = None
+            if debug_dir is not None:
+                iteration_debug_dir = debug_dir / f"iteration_{iteration:02d}"
+                iteration_debug_dir.mkdir(parents=True, exist_ok=True)
+
             # Extract one tree from remaining points
             tree_data = self._extract_single_tree(
                 k_neighbors_initial=k_neighbors_initial,
                 k_neighbors_optimization=k_neighbors_optimization,
                 min_tree_size=min_tree_size,
-                method=root_method
+                method=root_method,
+                export_debug_dir=iteration_debug_dir
             )
 
             if tree_data is None:
@@ -871,7 +1020,8 @@ class MultiTreeReconstruction:
 
         return self.trees
 
-    def _extract_single_tree(self, k_neighbors_initial, k_neighbors_optimization, min_tree_size, method):
+    def _extract_single_tree(self, k_neighbors_initial, k_neighbors_optimization,
+                             min_tree_size, method, export_debug_dir=None):
         """
         Extract one tree from remaining points using sparse connectivity
         """
@@ -918,7 +1068,8 @@ class MultiTreeReconstruction:
             mu=self.mu,
             Q_perf=self.Q_perf,
             P_out=self.P_out,
-            P_in=self.P_in
+            P_in=self.P_in,
+            debug_export_dir=export_debug_dir
         )
 
         try:
@@ -926,7 +1077,8 @@ class MultiTreeReconstruction:
                 k_neighbors=k_neighbors_optimization,
                 n_candidates=5,
                 optimize_bifurcations=True,
-                method=method
+                method=method,
+                export_debug_dir=export_debug_dir
             )
         except Exception as e:
             print(f"  Failed to reconstruct tree: {e}")
